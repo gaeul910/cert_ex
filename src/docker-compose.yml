@@ -428,17 +428,15 @@ services:
 
   # WG-Dashboard
   wgdashboard:
-    image: donaldzou/wgdashboard
+    image: donaldzou/wgdashboard:latest
     container_name: wgdashboard
-    entrypoint: /entrypoint.sh
     environment:
-      - WGDASHBOARD_DIR=/opt/wgdashboard
+      - WG_HOST=0.0.0.0
     secrets:
       - wgdashboard_username
       - wgdashboard_password
     volumes:
       - ./wg-easy-config:/etc/wireguard
-      - ./wg-easy/entrypoint.sh:/entrypoint.sh:ro
     ports:
       - "51820:51820/udp"
       - "51821:10086/tcp"
@@ -457,13 +455,8 @@ services:
     container_name: dns-server
     hostname: 172.30.0.2
     image: technitium/dns-server:latest
-    entrypoint: /entrypoint.sh
-    # ports:
-    #   - "5380:5380/tcp" #DNS web console
-    #   - "53:53/udp" #DNS service
-    #   - "53:53/tcp" #DNS service
-    #   - "67:67/udp" #DHCP service
     environment:
+      - DNS_SERVER_ADMIN_PASSWORD_FILE=/run/secrets/dns_admin_password
       - DNS_SERVER_DOMAIN=dns-server
       - DNS_SERVER_WEB_SERVICE_HTTP_PORT=5380
       - DNS_SERVER_LOG_CONSOLE_LEVEL=Error
@@ -471,7 +464,6 @@ services:
       - dns_admin_password
     volumes:
       - ./dns_config:/etc/dns
-      - ./secrets/dns-entrypoint.sh:/entrypoint.sh:ro
     ports:
       - "5380:5380/tcp"
       - "53:53/udp"
@@ -546,7 +538,15 @@ services:
   # Docmost Wiki
   docmost:
     image: docmost/docmost:latest
-    entrypoint: /entrypoint.sh
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        export APP_SECRET=$$(cat /run/secrets/docmost_app_secret)
+        export DB_PASSWORD=$$(cat /run/secrets/docmost_db_password)
+        export DATABASE_URL="postgresql://docmost:$${DB_PASSWORD}@docmost-postgres:5432/docmost?schema=public"
+        cd /app
+        exec pnpm start
     environment:
       - APP_URL=https://docmost.certcbnu.kr
       - HOST=0.0.0.0
@@ -557,7 +557,6 @@ services:
       - docmost_db_password
     volumes:
       - docmost_data:/app/data/uploads
-      - ./secrets/docmost-entrypoint.sh:/entrypoint.sh:ro
     networks:
       - cert_net
     depends_on:
