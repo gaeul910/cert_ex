@@ -1,0 +1,612 @@
+services:
+  # Database for Keycloak
+  postgres:
+    image: postgres:15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD_FILE: /run/secrets/keycloak_postgres_password
+    secrets:
+      - keycloak_postgres_password
+    networks:
+      - cert_net
+    restart: unless-stopped
+
+  # Keycloak Service
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    entrypoint:
+      - /bin/sh
+      - /opt/keycloak/bin/start-with-secrets.sh
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KEYCLOAK_ADMIN: admin
+      KC_HOSTNAME: https://auth.certcbnu.kr
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+    secrets:
+      - keycloak_postgres_password
+      - keycloak_admin_password
+    volumes:
+      - ./keycloak/start-with-secrets.sh:/opt/keycloak/bin/start-with-secrets.sh:ro
+    depends_on:
+      - postgres
+    extra_hosts:
+      - "frappecentral.certcbnu.kr:172.25.0.250"
+    networks:
+      - cert_net
+    restart: unless-stopped
+
+  # Database for Frappe
+  frappe-db:
+    image: mariadb:10.6
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed # Temporary fix for some versions
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/frappe_db_root_password
+      MYSQL_DATABASE: frappe
+      MYSQL_USER: frappe
+      MYSQL_PASSWORD_FILE: /run/secrets/frappe_db_user_password
+    secrets:
+      - frappe_db_root_password
+      - frappe_db_user_password
+    volumes:
+      - frappe_mariadb_data:/var/lib/mysql
+    networks:
+      - cert_net
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pidof mariadbd >/dev/null && test -S /run/mysqld/mysqld.sock",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Redis for Frappe
+  frappe-redis-cache:
+    image: redis:alpine
+    networks:
+      - cert_net
+    restart: unless-stopped
+
+  frappe-redis-queue:
+    image: redis:alpine
+    networks:
+      - cert_net
+    restart: unless-stopped
+
+  frappe-redis-socketio:
+    image: redis:alpine
+    networks:
+      - cert_net
+    restart: unless-stopped
+
+  # Frappe Configurator (Run once to setup site)
+
+  frappe-configurator:
+    build:
+      context: ./frappe-custom
+    image: frappe-custom:v15
+    pull_policy: never
+    command:
+      - /bin/bash
+      - -c
+      - |
+        echo 'Waiting for database to be ready...';
+        sleep 15;
+        DB_ROOT_PASSWORD=$$(cat /run/secrets/frappe_db_root_password);
+        FRAPPE_ADMIN_PASSWORD=$$(cat /run/secrets/frappe_admin_password);
+
+        if [ ! -f /home/frappe/frappe-bench/sites/apps.txt ]; then
+          echo 'Initializing Docker Sites Volume...';
+          echo 'frappe' > /home/frappe/frappe-bench/sites/apps.txt;
+          echo 'erpnext' >> /home/frappe/frappe-bench/sites/apps.txt;
+        fi;
+
+        # apps.txt 보정: erpnextlms 등 잘못된 항목을 erpnext로 수정
+        sed -i 's/^erpnextlms$/erpnext/' /home/frappe/frappe-bench/sites/apps.txt;
+
+        bench setup config;
+        bench set-config -g db_host frappe-db;
+        bench set-config -g redis_cache redis://frappe-redis-cache:6379;
+        bench set-config -g redis_queue redis://frappe-redis-queue:6379;
+        bench set-config -g redis_socketio redis://frappe-redis-socketio:6379;
+
+        if [ ! -d /home/frappe/frappe-bench/sites/frappecentral.certcbnu.kr ]; then
+          echo 'Creating Site...';
+          bench new-site frappecentral.certcbnu.kr --no-mariadb-socket --admin-password "$${FRAPPE_ADMIN_PASSWORD}" --db-root-username root --db-root-password "$${DB_ROOT_PASSWORD}" --db-type mariadb --db-host frappe-db --install-app erpnext;
+          bench --site frappecentral.certcbnu.kr set-config developer_mode 1;
+          bench --site frappecentral.certcbnu.kr enable-scheduler;
+          bench use frappecentral.certcbnu.kr;
+        fi;
+
+        # Disable Social Login (prevent Keycloak auto-redirect)
+        bench --site frappecentral.certcbnu.kr execute frappe.db.sql --args '["UPDATE `tabSocial Login Key` SET enable_social_login=0"]' || true;
+        echo 'Configuration completed successfully';
+    environment:
+      - DB_HOST=frappe-db
+    volumes:
+      - frappe_sites:/home/frappe/frappe-bench/sites
+      - frappe_logs:/home/frappe/frappe-bench/logs
+    secrets:
+      - frappe_db_root_password
+      - frappe_admin_password
+    networks:
+      - cert_net
+    depends_on:
+      frappe-db:
+        condition: service_healthy
+      frappe-redis-cache:
+        condition: service_started
+      frappe-redis-queue:
+        condition: service_started
+    restart: "no"
+
+  # Frappe Backend
+  frappe-backend:
+    image: frappe-custom:v15
+    pull_policy: never
+    command:
+      - /bin/bash
+      - -c
+      - |
+        # frappe_lms symlink: app_name=frappe_lms 이지만 모듈 디렉토리는 lms
+        ln -sf /home/frappe/frappe-bench/apps/lms/lms /home/frappe/frappe-bench/apps/lms/frappe_lms 2>/dev/null || true
+        export DB_PASSWORD="$$(cat /run/secrets/frappe_db_user_password)"
+        cd /home/frappe/frappe-bench
+        bench use frappecentral.certcbnu.kr
+        cd sites
+        /home/frappe/frappe-bench/env/bin/gunicorn -b 0.0.0.0:8000 -w 4 --timeout 120 frappe.app:application --preload
+    restart: unless-stopped
+    working_dir: /home/frappe/frappe-bench/sites
+    environment:
+      - DB_HOST=frappe-db
+      - DB_USER=frappe
+      - REDIS_CACHE=redis://frappe-redis-cache:6379
+      - REDIS_QUEUE=redis://frappe-redis-queue:6379
+      - REDIS_SOCKETIO=redis://frappe-redis-socketio:6379
+      - SOCKETIO_PORT=9000
+    volumes:
+      - frappe_sites:/home/frappe/frappe-bench/sites
+      - frappe_logs:/home/frappe/frappe-bench/logs
+    secrets:
+      - frappe_db_user_password
+    networks:
+      - cert_net
+    extra_hosts:
+      - "auth.certcbnu.kr:172.25.0.250"
+    depends_on:
+      frappe-db:
+        condition: service_healthy
+      frappe-redis-cache:
+        condition: service_started
+      frappe-redis-queue:
+        condition: service_started
+      frappe-redis-socketio:
+        condition: service_started
+      frappe-configurator:
+        condition: service_completed_successfully
+
+  # Frappe Frontend (Nginx)
+  frappe-frontend:
+    image: frappe-custom:v15
+    pull_policy: never
+    command:
+      - /bin/bash
+      - -c
+      - |
+        # Ensure app asset symlinks exist for all installed apps
+        for app in lms wiki; do
+          app_public="/home/frappe/frappe-bench/apps/$${app}/$${app}/public"
+          if [ -d "$${app_public}" ]; then
+            ln -sf "$${app_public}" "/home/frappe/frappe-bench/sites/assets/$${app}" 2>/dev/null || true
+          fi
+        done
+        # frappe_lms is the pip package name for the lms app
+        ln -sf /home/frappe/frappe-bench/apps/lms/lms/public \
+               /home/frappe/frappe-bench/sites/assets/frappe_lms 2>/dev/null || true
+        nginx-entrypoint.sh
+    environment:
+      - BACKEND=frappe-backend:8000
+      - FRAPPE_SITE_NAME_HEADER=$$host
+      - SOCKETIO=frappe-socketio:9000
+      - UPSTREAM_REAL_IP_ADDRESS=172.25.0.0/16
+      - UPSTREAM_REAL_IP_HEADER=X-Forwarded-For
+      - UPSTREAM_REAL_IP_RECURSIVE=on
+      - PROXY_READ_TIMEOUT=120
+      - CLIENT_MAX_BODY_SIZE=50m
+    volumes:
+      - frappe_sites:/home/frappe/frappe-bench/sites
+      - frappe_logs:/home/frappe/frappe-bench/logs
+    networks:
+      - cert_net
+    depends_on:
+      frappe-backend:
+        condition: service_started
+    restart: unless-stopped
+
+  # Frappe Socket.IO (Real-time)
+
+  frappe-socketio:
+    image: frappe-custom:v15
+    pull_policy: never
+    command:
+      - /bin/bash
+      - -c
+      - |
+        ln -sf /home/frappe/frappe-bench/apps/lms/lms /home/frappe/frappe-bench/apps/lms/frappe_lms 2>/dev/null || true
+        export DB_PASSWORD="$$(cat /run/secrets/frappe_db_user_password)"
+        node /home/frappe/frappe-bench/apps/frappe/socketio.js
+    environment:
+      - DB_HOST=frappe-db
+      - DB_USER=frappe
+      - REDIS_CACHE=redis://frappe-redis-cache:6379
+      - REDIS_QUEUE=redis://frappe-redis-queue:6379
+      - REDIS_SOCKETIO=redis://frappe-redis-socketio:6379
+      - SOCKETIO_PORT=9000
+    volumes:
+      - frappe_sites:/home/frappe/frappe-bench/sites
+      - frappe_logs:/home/frappe/frappe-bench/logs
+    secrets:
+      - frappe_db_user_password
+    networks:
+      - cert_net
+    depends_on:
+      - frappe-backend
+    restart: unless-stopped
+
+  # Frappe Queue (Short)
+  frappe-queue-short:
+    image: frappe-custom:v15
+    pull_policy: never
+    command:
+      - /bin/bash
+      - -c
+      - |
+        ln -sf /home/frappe/frappe-bench/apps/lms/lms /home/frappe/frappe-bench/apps/lms/frappe_lms 2>/dev/null || true
+        export DB_PASSWORD="$$(cat /run/secrets/frappe_db_user_password)"
+        bench worker --queue short,default
+    environment:
+      - DB_HOST=frappe-db
+      - DB_USER=frappe
+      - REDIS_CACHE=redis://frappe-redis-cache:6379
+      - REDIS_QUEUE=redis://frappe-redis-queue:6379
+      - REDIS_SOCKETIO=redis://frappe-redis-socketio:6379
+      - SOCKETIO_PORT=9000
+    volumes:
+      - frappe_sites:/home/frappe/frappe-bench/sites
+      - frappe_logs:/home/frappe/frappe-bench/logs
+    secrets:
+      - frappe_db_user_password
+    networks:
+      - cert_net
+    depends_on:
+      - frappe-backend
+    restart: unless-stopped
+
+  # Frappe Queue (Long)
+  frappe-queue-long:
+    image: frappe-custom:v15
+    pull_policy: never
+    command:
+      - /bin/bash
+      - -c
+      - |
+        ln -sf /home/frappe/frappe-bench/apps/lms/lms /home/frappe/frappe-bench/apps/lms/frappe_lms 2>/dev/null || true
+        export DB_PASSWORD="$$(cat /run/secrets/frappe_db_user_password)"
+        bench worker --queue long
+    environment:
+      - DB_HOST=frappe-db
+      - DB_USER=frappe
+      - REDIS_CACHE=redis://frappe-redis-cache:6379
+      - REDIS_QUEUE=redis://frappe-redis-queue:6379
+      - REDIS_SOCKETIO=redis://frappe-redis-socketio:6379
+      - SOCKETIO_PORT=9000
+    volumes:
+      - frappe_sites:/home/frappe/frappe-bench/sites
+      - frappe_logs:/home/frappe/frappe-bench/logs
+    secrets:
+      - frappe_db_user_password
+    networks:
+      - cert_net
+    depends_on:
+      - frappe-backend
+    restart: unless-stopped
+
+  # Frappe Scheduler
+  frappe-scheduler:
+    image: frappe-custom:v15
+    pull_policy: never
+    command:
+      - /bin/bash
+      - -c
+      - |
+        ln -sf /home/frappe/frappe-bench/apps/lms/lms /home/frappe/frappe-bench/apps/lms/frappe_lms 2>/dev/null || true
+        export DB_PASSWORD="$$(cat /run/secrets/frappe_db_user_password)"
+        bench schedule
+    environment:
+      - DB_HOST=frappe-db
+      - DB_USER=frappe
+      - REDIS_CACHE=redis://frappe-redis-cache:6379
+      - REDIS_QUEUE=redis://frappe-redis-queue:6379
+      - REDIS_SOCKETIO=redis://frappe-redis-socketio:6379
+      - SOCKETIO_PORT=9000
+    volumes:
+      - frappe_sites:/home/frappe/frappe-bench/sites
+      - frappe_logs:/home/frappe/frappe-bench/logs
+    secrets:
+      - frappe_db_user_password
+    networks:
+      - cert_net
+    depends_on:
+      - frappe-backend
+    restart: unless-stopped
+
+  # Frappe Learning & Wiki Configurator (Run once to setup learning/wiki sites)
+  frappe-learning-wiki-configurator:
+    image: frappe-custom:v15
+    pull_policy: never
+    command:
+      - /bin/bash
+      - -c
+      - |
+        echo 'Waiting for database to be ready...';
+        sleep 15;
+        DB_ROOT_PASSWORD=$$(cat /run/secrets/frappe_db_root_password);
+        FRAPPE_ADMIN_PASSWORD=$$(cat /run/secrets/frappe_admin_password);
+
+        # lms 앱이 있으면 실제 app_name을 hooks.py에서 읽어 apps.txt에 등록
+        if [ -d /home/frappe/frappe-bench/apps/lms ]; then
+          ln -sf /home/frappe/frappe-bench/apps/lms/lms /home/frappe/frappe-bench/apps/lms/frappe_lms 2>/dev/null || true;
+          LMS_APP_NAME=$$(grep -m1 '^app_name' /home/frappe/frappe-bench/apps/lms/lms/hooks.py | cut -d'"' -f2 2>/dev/null || echo 'lms');
+          grep -qxF "$${LMS_APP_NAME}" /home/frappe/frappe-bench/sites/apps.txt || echo "$${LMS_APP_NAME}" >> /home/frappe/frappe-bench/sites/apps.txt;
+        fi;
+
+        # wiki 앱이 있으면 실제 app_name을 hooks.py에서 읽어 apps.txt에 등록
+        if [ -d /home/frappe/frappe-bench/apps/wiki ]; then
+          WIKI_APP_NAME=$$(grep -m1 '^app_name' /home/frappe/frappe-bench/apps/wiki/wiki/hooks.py | cut -d'"' -f2 2>/dev/null || echo 'wiki');
+          grep -qxF "$${WIKI_APP_NAME}" /home/frappe/frappe-bench/sites/apps.txt || echo "$${WIKI_APP_NAME}" >> /home/frappe/frappe-bench/sites/apps.txt;
+        fi;
+
+        bench setup config;
+        bench set-config -g db_host frappe-db;
+        bench set-config -g redis_cache redis://frappe-redis-cache:6379;
+        bench set-config -g redis_queue redis://frappe-redis-queue:6379;
+        bench set-config -g redis_socketio redis://frappe-redis-socketio:6379;
+
+        if [ ! -d /home/frappe/frappe-bench/sites/seminar.certcbnu.kr ]; then
+          echo 'Creating seminar (LMS) site...';
+          bench new-site seminar.certcbnu.kr --no-mariadb-socket --admin-password "$${FRAPPE_ADMIN_PASSWORD}" --db-root-username root --db-root-password "$${DB_ROOT_PASSWORD}" --db-type mariadb --db-host frappe-db --install-app lms;
+          bench --site seminar.certcbnu.kr set-config developer_mode 1;
+          bench --site seminar.certcbnu.kr set-config lms_path lms;
+          bench --site seminar.certcbnu.kr enable-scheduler;
+          bench --site seminar.certcbnu.kr execute frappe.db.set_single_value --args '["Website Settings", "home_page", "lms"]';
+        fi;
+
+        # Disable Social Login (prevent Keycloak auto-redirect)
+        bench --site seminar.certcbnu.kr execute frappe.db.sql --args '["UPDATE \`tabSocial Login Key\` SET enable_social_login=0"]' || true;
+
+        if [ ! -d /home/frappe/frappe-bench/sites/wiki.certcbnu.kr ]; then
+          echo 'Creating wiki site...';
+          bench new-site wiki.certcbnu.kr --no-mariadb-socket --admin-password "$${FRAPPE_ADMIN_PASSWORD}" --db-root-username root --db-root-password "$${DB_ROOT_PASSWORD}" --db-type mariadb --db-host frappe-db --install-app wiki;
+          bench --site wiki.certcbnu.kr set-config developer_mode 1;
+          bench --site wiki.certcbnu.kr enable-scheduler;
+        fi;
+
+        echo 'Learning & Wiki configuration completed successfully';
+    environment:
+      - DB_HOST=frappe-db
+    volumes:
+      - frappe_sites:/home/frappe/frappe-bench/sites
+      - frappe_logs:/home/frappe/frappe-bench/logs
+    secrets:
+      - frappe_db_root_password
+      - frappe_admin_password
+    networks:
+      - cert_net
+    depends_on:
+      frappe-db:
+        condition: service_healthy
+      frappe-redis-cache:
+        condition: service_started
+      frappe-redis-queue:
+        condition: service_started
+      frappe-configurator:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # WG-Dashboard
+  wgdashboard:
+    image: donaldzou/wgdashboard
+    container_name: wgdashboard
+    entrypoint: /entrypoint.sh
+    environment:
+      - WGDASHBOARD_DIR=/opt/wgdashboard
+    secrets:
+      - wgdashboard_username
+      - wgdashboard_password
+    volumes:
+      - ./wg-easy-config:/etc/wireguard
+      - ./wg-easy/entrypoint.sh:/entrypoint.sh:ro
+    ports:
+      - "51820:51820/udp"
+      - "51821:10086/tcp"
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      - wg_net
+    restart: unless-stopped
+
+  # Technitium DNS
+  dns-server:
+    container_name: dns-server
+    hostname: 172.30.0.2
+    image: technitium/dns-server:latest
+    entrypoint: /entrypoint.sh
+    # ports:
+    #   - "5380:5380/tcp" #DNS web console
+    #   - "53:53/udp" #DNS service
+    #   - "53:53/tcp" #DNS service
+    #   - "67:67/udp" #DHCP service
+    environment:
+      - DNS_SERVER_DOMAIN=dns-server
+      - DNS_SERVER_WEB_SERVICE_HTTP_PORT=5380
+      - DNS_SERVER_LOG_CONSOLE_LEVEL=Error
+    secrets:
+      - dns_admin_password
+    volumes:
+      - ./dns_config:/etc/dns
+      - ./secrets/dns-entrypoint.sh:/entrypoint.sh:ro
+    ports:
+      - "5380:5380/tcp"
+      - "53:53/udp"
+      - "53:53/tcp"
+    networks:
+      wg_net:
+        ipv4_address: 172.30.0.2
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:latest
+    container_name: internal-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf:/etc/nginx/conf.d
+      - /etc/letsencrypt:/etc/nginx/certs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      cert_net:
+        ipv4_address: 172.25.0.250 # Static IP so DNS can point to it
+      wg_net:
+        ipv4_address: 172.30.0.5 # Static IP so DNS can point to it
+    restart: unless-stopped
+
+  # Homarr Dashboard
+  homarr:
+    image: ghcr.io/ajnart/homarr:latest
+    container_name: homarr
+    restart: unless-stopped
+    volumes:
+      - ./homarr_configs/configs:/app/data/configs
+      - ./homarr_configs/icons:/app/public/icons
+      - ./homarr_configs/data:/data
+    ports:
+      - "7575:7575"
+    networks:
+      - cert_net
+      - wg_net
+
+  # Docmost Wiki - Database
+  docmost-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: docmost
+      POSTGRES_USER: docmost
+      POSTGRES_PASSWORD_FILE: /run/secrets/docmost_postgres_password
+    secrets:
+      - docmost_postgres_password
+    volumes:
+      - docmost_db_data:/var/lib/postgresql/data
+    networks:
+      - cert_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docmost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Docmost Wiki - Redis
+  docmost-redis:
+    image: redis:7.2-alpine
+    volumes:
+      - docmost_redis_data:/data
+    networks:
+      - cert_net
+    restart: unless-stopped
+
+  # Docmost Wiki
+  docmost:
+    image: docmost/docmost:latest
+    entrypoint: /entrypoint.sh
+    environment:
+      - APP_URL=https://docmost.certcbnu.kr
+      - HOST=0.0.0.0
+      - PORT=3000
+      - REDIS_URL=redis://docmost-redis:6379
+    secrets:
+      - docmost_app_secret
+      - docmost_db_password
+    volumes:
+      - docmost_data:/app/data/uploads
+      - ./secrets/docmost-entrypoint.sh:/entrypoint.sh:ro
+    networks:
+      - cert_net
+    depends_on:
+      docmost-postgres:
+        condition: service_healthy
+      docmost-redis:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  frappe_mariadb_data:
+  frappe_sites:
+  frappe_logs:
+  docmost_db_data:
+  docmost_redis_data:
+  docmost_data:
+
+secrets:
+  keycloak_postgres_password:
+    file: ./secrets/keycloak_postgres_password.txt
+  keycloak_admin_password:
+    file: ./secrets/keycloak_admin_password.txt
+  frappe_db_root_password:
+    file: ./secrets/frappe_db_root_password.txt
+  frappe_db_user_password:
+    file: ./secrets/frappe_db_user_password.txt
+  frappe_admin_password:
+    file: ./secrets/frappe_admin_password.txt
+  docmost_postgres_password:
+    file: ./secrets/docmost_postgres_password.txt
+  wgdashboard_username:
+    file: ./secrets/wgdashboard_username.txt
+  wgdashboard_password:
+    file: ./secrets/wgdashboard_password.txt
+  dns_admin_password:
+    file: ./secrets/dns_admin_password.txt
+  docmost_app_secret:
+    file: ./secrets/docmost_app_secret.txt
+  docmost_db_password:
+    file: ./secrets/docmost_db_password.txt
+
+networks:
+  cert_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
+  wg_net:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
