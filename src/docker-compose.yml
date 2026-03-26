@@ -402,6 +402,10 @@ services:
           bench new-site wiki.certcbnu.kr --no-mariadb-socket --admin-password "$${FRAPPE_ADMIN_PASSWORD}" --db-root-username root --db-root-password "$${DB_ROOT_PASSWORD}" --db-type mariadb --db-host frappe-db --install-app wiki;
           bench --site wiki.certcbnu.kr set-config developer_mode 1;
           bench --site wiki.certcbnu.kr enable-scheduler;
+          # Keep setup wizard available for first interactive wiki configuration
+          bench --site wiki.certcbnu.kr execute frappe.db.set_single_value --args '["System Settings", "setup_complete", 0]';
+          # Prevent forced external auth redirect during initial setup
+          bench --site wiki.certcbnu.kr execute frappe.db.sql --args '["UPDATE `tabSocial Login Key` SET enable_social_login=0"]' || true;
         fi;
 
         echo 'Learning & Wiki configuration completed successfully';
@@ -474,11 +478,15 @@ services:
     restart: unless-stopped
 
   nginx:
-    image: nginx:latest
+    build:
+      context: ./nginx-waf
+    image: cert-nginx-waf:latest
     container_name: internal-nginx
-    ports:
-      - "80:80"
-      - "443:443"
+    environment:
+      - WAF_MODE=On
+      - WAF_PARANOIA=1
+      - WAF_INBOUND_ANOMALY=10
+      - WAF_OUTBOUND_ANOMALY=10
     volumes:
       - ./nginx/conf:/etc/nginx/conf.d
       - /etc/letsencrypt:/etc/nginx/certs
@@ -500,8 +508,6 @@ services:
       - ./homarr_configs/configs:/app/data/configs
       - ./homarr_configs/icons:/app/public/icons
       - ./homarr_configs/data:/data
-    ports:
-      - "7575:7575"
     networks:
       - cert_net
       - wg_net
@@ -544,6 +550,14 @@ services:
       - |
         export APP_SECRET=$$(cat /run/secrets/docmost_app_secret)
         export DB_PASSWORD=$$(cat /run/secrets/docmost_db_password)
+        if [ -s /run/secrets/docmost_smtp_username ] && [ -s /run/secrets/docmost_smtp_password ]; then
+          export MAIL_DRIVER=smtp
+          export SMTP_USERNAME=$$(cat /run/secrets/docmost_smtp_username)
+          export SMTP_PASSWORD=$$(cat /run/secrets/docmost_smtp_password)
+          if [ -z "$${MAIL_FROM_ADDRESS:-}" ]; then
+            export MAIL_FROM_ADDRESS="$${SMTP_USERNAME}"
+          fi
+        fi
         export DATABASE_URL="postgresql://docmost:$${DB_PASSWORD}@docmost-postgres:5432/docmost?schema=public"
         cd /app
         exec pnpm start
@@ -552,9 +566,17 @@ services:
       - HOST=0.0.0.0
       - PORT=3000
       - REDIS_URL=redis://docmost-redis:6379
+      - MAIL_DRIVER=smtp
+      - SMTP_HOST=smtp-relay.brevo.com
+      - SMTP_PORT=587
+      - SMTP_SECURE=false
+      - MAIL_FROM_ADDRESS=${DOCMOST_MAIL_FROM_ADDRESS:-}
+      - MAIL_FROM_NAME=Docmost
     secrets:
       - docmost_app_secret
       - docmost_db_password
+      - docmost_smtp_username
+      - docmost_smtp_password
     volumes:
       - docmost_data:/app/data/uploads
     networks:
@@ -598,6 +620,10 @@ secrets:
     file: ./secrets/docmost_app_secret.txt
   docmost_db_password:
     file: ./secrets/docmost_db_password.txt
+  docmost_smtp_username:
+    file: ./secrets/docmost_smtp_username.txt
+  docmost_smtp_password:
+    file: ./secrets/docmost_smtp_password.txt
 
 networks:
   cert_net:
