@@ -131,6 +131,12 @@ services:
           bench use frappecentral.certcbnu.kr;
         fi;
 
+        # Install Wiki and LMS apps for the main site
+        echo 'Installing Wiki app...';
+        bench --site frappecentral.certcbnu.kr install-app wiki;
+        echo 'Installing LMS app...';
+        bench --site frappecentral.certcbnu.kr install-app frappe_lms;
+
         # Disable Social Login (prevent Keycloak auto-redirect)
         bench --site frappecentral.certcbnu.kr execute frappe.db.sql --args '["UPDATE `tabSocial Login Key` SET enable_social_login=0"]' || true;
         echo 'Configuration completed successfully';
@@ -216,6 +222,42 @@ services:
         # frappe_lms is the pip package name for the lms app
         ln -sf /home/frappe/frappe-bench/apps/lms/lms/public \
                /home/frappe/frappe-bench/sites/assets/frappe_lms 2>/dev/null || true
+        # Repair stale hashed asset references left in persisted assets.json
+        python3 - <<'PY'
+        import glob
+        import json
+        import os
+
+        manifest = "/home/frappe/frappe-bench/sites/assets/assets.json"
+        if os.path.exists(manifest):
+            with open(manifest, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            for _, rel in data.items():
+                if not isinstance(rel, str) or not rel.startswith("/assets/"):
+                    continue
+
+                target = "/home/frappe/frappe-bench/sites" + rel
+                if os.path.exists(target):
+                    continue
+
+                directory = os.path.dirname(target)
+                filename = os.path.basename(target)
+                if ".bundle." not in filename:
+                    continue
+
+                prefix, suffix = filename.split(".bundle.", 1)
+                ext = "." + suffix.split(".")[-1] if "." in suffix else ""
+                pattern = os.path.join(directory, f"{prefix}.bundle.*{ext}")
+                candidates = [p for p in glob.glob(pattern) if os.path.isfile(p)]
+                if not candidates:
+                    continue
+
+                candidates.sort(key=os.path.getmtime, reverse=True)
+                source_name = os.path.basename(candidates[0])
+                os.makedirs(directory, exist_ok=True)
+                os.symlink(source_name, target)
+        PY
         nginx-entrypoint.sh
     environment:
       - BACKEND=frappe-backend:8000
@@ -499,15 +541,13 @@ services:
         ipv4_address: 172.30.0.5 # Static IP so DNS can point to it
     restart: unless-stopped
 
-  # Homarr Dashboard
-  homarr:
-    image: ghcr.io/ajnart/homarr:latest
-    container_name: homarr
+  # Glance Dashboard
+  glance:
+    image: glanceapp/glance:latest
+    container_name: glance
     restart: unless-stopped
     volumes:
-      - ./homarr_configs/configs:/app/data/configs
-      - ./homarr_configs/icons:/app/public/icons
-      - ./homarr_configs/data:/data
+      - ./glance:/app/config
     networks:
       - cert_net
       - wg_net
